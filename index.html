@@ -1190,9 +1190,13 @@
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 // ===================== CONFIG =====================
-const KAKAO_API_KEY = ''; // 여기에 카카오 JavaScript API 키를 입력하세요
+const KAKAO_API_KEY = '067eb58b9533593151b29baaa7ae4392'; // 카카오 JavaScript API 키
+const SUPABASE_URL = 'https://nadzjutiocjdgsrexmrv.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_5zbZaP0EoQcn9zIGjWpZ1A_szKCJyl4';
+const supabaseClient = window.supabase?.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 
 // ===================== STATE =====================
 const defaultSettings = {
@@ -1221,6 +1225,9 @@ const state = {
   editingDiaryIndex: null,
   editingPlaceIndex: null,
   editingEventIndex: null,
+  coupleId: localStorage.getItem('coupleId') || null,
+  cloudReady: false,
+  cloudSaving: false,
 };
 
 function save() {
@@ -1229,6 +1236,8 @@ function save() {
   localStorage.setItem('places', JSON.stringify(state.places));
   localStorage.setItem('startDate', state.startDate);
   localStorage.setItem('settings', JSON.stringify(state.settings));
+  if (state.coupleId) localStorage.setItem('coupleId', state.coupleId);
+  scheduleCloudSave();
 }
 
 // ===================== UTILS =====================
@@ -1296,6 +1305,198 @@ function renderAuthorOptions(selectedRole = 'a') {
       <input type="radio" name="author" value="${role}" ${role === selectedRole ? 'checked' : ''}> ${getAuthorName(role)}
     </label>
   `).join('');
+}
+
+// ===================== SUPABASE =====================
+let cloudSaveTimer = null;
+
+function scheduleCloudSave() {
+  if (!supabaseClient || !state.cloudReady || state.cloudSaving) return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(() => saveToSupabase(), 450);
+}
+
+function tagsToArray(tags) {
+  if (Array.isArray(tags)) return tags;
+  return String(tags || '').split(',').map(t => t.trim()).filter(Boolean);
+}
+
+function tagsToText(tags) {
+  return Array.isArray(tags) ? tags.join(', ') : (tags || '');
+}
+
+async function ensureCouple() {
+  if (!supabaseClient) throw new Error('Supabase 클라이언트를 불러오지 못했어요');
+  if (state.coupleId) return state.coupleId;
+
+  const { data: existing, error: selectError } = await supabaseClient
+    .from('couples')
+    .select('id')
+    .limit(1)
+    .maybeSingle();
+  if (selectError) throw selectError;
+  if (existing?.id) {
+    state.coupleId = existing.id;
+    localStorage.setItem('coupleId', state.coupleId);
+    return state.coupleId;
+  }
+
+  const { data: created, error: insertError } = await supabaseClient
+    .from('couples')
+    .insert({
+      name: state.settings.coupleLabel,
+      start_date: state.startDate,
+      author_a: state.settings.authorA,
+      author_b: state.settings.authorB,
+    })
+    .select('id')
+    .single();
+  if (insertError) throw insertError;
+  state.coupleId = created.id;
+  localStorage.setItem('coupleId', state.coupleId);
+  return state.coupleId;
+}
+
+async function loadFromSupabase() {
+  if (!supabaseClient) return;
+  try {
+    const coupleId = await ensureCouple();
+    const [
+      coupleRes,
+      diariesRes,
+      eventsRes,
+      placesRes,
+    ] = await Promise.all([
+      supabaseClient.from('couples').select('*').eq('id', coupleId).single(),
+      supabaseClient.from('diaries').select('*').eq('couple_id', coupleId).order('diary_date', { ascending: false }),
+      supabaseClient.from('calendar_events').select('*').eq('couple_id', coupleId).order('start_date', { ascending: true }),
+      supabaseClient.from('places').select('*').eq('couple_id', coupleId).order('created_at', { ascending: true }),
+    ]);
+
+    const firstError = coupleRes.error || diariesRes.error || eventsRes.error || placesRes.error;
+    if (firstError) throw firstError;
+
+    if (coupleRes.data) {
+      state.startDate = coupleRes.data.start_date || state.startDate;
+      state.settings = {
+        ...state.settings,
+        coupleLabel: coupleRes.data.name || state.settings.coupleLabel,
+        authorA: coupleRes.data.author_a || state.settings.authorA,
+        authorB: coupleRes.data.author_b || state.settings.authorB,
+      };
+    }
+
+    if (diariesRes.data?.length) {
+      state.diaries = diariesRes.data.map(d => ({
+        title: d.title || '',
+        content: d.content || '',
+        date: d.diary_date,
+        tags: tagsToText(d.tags),
+        authorRole: d.author_role || 'a',
+        author: getAuthorName(d.author_role || 'a'),
+        photos: [],
+      }));
+    }
+
+    if (eventsRes.data?.length) {
+      state.events = eventsRes.data.map(e => ({
+        name: e.name,
+        desc: e.description || '',
+        date: e.start_date,
+        startDate: e.start_date,
+        endDate: e.end_date || e.start_date,
+        type: e.type || 'schedule',
+      }));
+    }
+
+    if (placesRes.data?.length) {
+      state.places = placesRes.data.map(p => ({
+        name: p.name,
+        addr: p.address || '',
+        category: p.category || '카페',
+        visited: !!p.visited,
+      }));
+    }
+
+    state.cloudReady = true;
+    localStorage.setItem('diaries', JSON.stringify(state.diaries));
+    localStorage.setItem('events', JSON.stringify(state.events));
+    localStorage.setItem('places', JSON.stringify(state.places));
+    localStorage.setItem('startDate', state.startDate);
+    localStorage.setItem('settings', JSON.stringify(state.settings));
+    updateCoupleUI();
+    renderHome();
+    renderCalendar();
+    showToast('Supabase와 연결됐어요');
+  } catch (err) {
+    console.warn('Supabase load failed:', err);
+    state.cloudReady = false;
+    showToast('Supabase 연결을 확인해주세요');
+  }
+}
+
+async function saveToSupabase() {
+  if (!supabaseClient || !state.coupleId) return;
+  state.cloudSaving = true;
+  try {
+    const coupleId = await ensureCouple();
+    const coupleRes = await supabaseClient
+      .from('couples')
+      .update({
+        name: state.settings.coupleLabel,
+        start_date: state.startDate,
+        author_a: state.settings.authorA,
+        author_b: state.settings.authorB,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', coupleId);
+    if (coupleRes.error) throw coupleRes.error;
+
+    const deleteResults = await Promise.all([
+      supabaseClient.from('diaries').delete().eq('couple_id', coupleId),
+      supabaseClient.from('calendar_events').delete().eq('couple_id', coupleId),
+      supabaseClient.from('places').delete().eq('couple_id', coupleId),
+    ]);
+    const deleteError = deleteResults.find(res => res.error)?.error;
+    if (deleteError) throw deleteError;
+
+    const diaryRows = state.diaries.map(d => ({
+      couple_id: coupleId,
+      author_role: getDiaryAuthorRole(d),
+      diary_date: d.date,
+      title: d.title || '',
+      content: d.content || '',
+      tags: tagsToArray(d.tags),
+    }));
+    const eventRows = state.events.map(e => ({
+      couple_id: coupleId,
+      name: e.name,
+      description: e.desc || '',
+      start_date: eventStartDate(e),
+      end_date: e.type === 'schedule' ? eventEndDate(e) : eventStartDate(e),
+      type: e.type || 'schedule',
+    }));
+    const placeRows = state.places.map(p => ({
+      couple_id: coupleId,
+      name: p.name,
+      address: p.addr || '',
+      category: p.category || '카페',
+      visited: !!p.visited,
+    }));
+
+    const insertResults = await Promise.all([
+      diaryRows.length ? supabaseClient.from('diaries').insert(diaryRows) : Promise.resolve({ error: null }),
+      eventRows.length ? supabaseClient.from('calendar_events').insert(eventRows) : Promise.resolve({ error: null }),
+      placeRows.length ? supabaseClient.from('places').insert(placeRows) : Promise.resolve({ error: null }),
+    ]);
+    const insertError = insertResults.find(res => res.error)?.error;
+    if (insertError) throw insertError;
+  } catch (err) {
+    console.warn('Supabase save failed:', err);
+    showToast('Supabase 저장을 확인해주세요');
+  } finally {
+    state.cloudSaving = false;
+  }
 }
 
 // ===================== NAVIGATE =====================
@@ -1894,6 +2095,7 @@ function initKakaoMap() {
 updateCoupleUI();
 renderHome();
 renderCalendar();
+loadFromSupabase();
 </script>
 </body>
 </html>
