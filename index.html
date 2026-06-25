@@ -1583,12 +1583,14 @@ function normalizeMedia(item) {
       type: item.startsWith('data:video') ? 'video' : 'image',
       src: item,
       name: '',
+      storagePath: '',
     };
   }
   return {
     type: item.type === 'video' ? 'video' : 'image',
     src: item.src || item.url || '',
     name: item.name || '',
+    storagePath: item.storagePath || item.storage_path || '',
   };
 }
 
@@ -1615,6 +1617,57 @@ function readFileAsDataUrl(file) {
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+function dataUrlToBlob(dataUrl) {
+  const [header, data] = dataUrl.split(',');
+  const mime = (header.match(/data:(.*?);base64/) || [])[1] || 'application/octet-stream';
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+function mediaExtension(media) {
+  if (media.type === 'video') return 'mp4';
+  if ((media.name || '').toLowerCase().endsWith('.png')) return 'png';
+  if ((media.name || '').toLowerCase().endsWith('.webp')) return 'webp';
+  return 'jpg';
+}
+
+function isLocalMedia(media) {
+  return (media.src || '').startsWith('data:');
+}
+
+async function uploadMediaToSupabase(media) {
+  if (!supabaseClient || !state.coupleId || !isLocalMedia(media)) return media;
+  const blob = dataUrlToBlob(media.src);
+  const id = (crypto.randomUUID && crypto.randomUUID()) || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const storagePath = `${state.coupleId}/diary/${id}.${mediaExtension(media)}`;
+  const { error } = await supabaseClient.storage
+    .from('diary-media')
+    .upload(storagePath, blob, {
+      contentType: blob.type,
+      upsert: true,
+    });
+  if (error) throw error;
+  const { data } = supabaseClient.storage.from('diary-media').getPublicUrl(storagePath);
+  return {
+    ...media,
+    src: data.publicUrl,
+    storagePath,
+  };
+}
+
+async function persistDiaryMedia(mediaList) {
+  if (!supabaseClient) return mediaList;
+  const coupleId = await ensureCouple();
+  state.coupleId = coupleId;
+  const uploaded = [];
+  for (const media of mediaList) {
+    uploaded.push(await uploadMediaToSupabase(media));
+  }
+  return uploaded;
 }
 
 function compressImageFile(file) {
@@ -1757,14 +1810,33 @@ async function loadFromSupabase() {
     }
 
     if (diariesRes.data?.length) {
-      const localMediaByKey = new Map(state.diaries.map(d => [diaryMediaKey(d), getDiaryMedia(d)]));
+      let photosByDiary = new Map();
+      const diaryIds = diariesRes.data.map(d => d.id).filter(Boolean);
+      if (diaryIds.length) {
+        const photosRes = await supabaseClient
+          .from('diary_photos')
+          .select('*')
+          .in('diary_id', diaryIds)
+          .order('sort_order', { ascending: true });
+        if (!photosRes.error && photosRes.data) {
+          photosByDiary = photosRes.data.reduce((map, photo) => {
+            const list = map.get(photo.diary_id) || [];
+            const publicUrl = supabaseClient.storage.from('diary-media').getPublicUrl(photo.storage_path).data.publicUrl;
+            list.push({
+              type: /\.(mp4|mov|webm)$/i.test(photo.storage_path) ? 'video' : 'image',
+              src: publicUrl,
+              storagePath: photo.storage_path,
+              name: '',
+            });
+            map.set(photo.diary_id, list);
+            return map;
+          }, new Map());
+        } else if (photosRes.error) {
+          console.warn('Diary photos load failed:', photosRes.error);
+        }
+      }
       state.diaries = diariesRes.data.map(d => {
-        const baseDiary = {
-          title: d.title || '',
-          content: d.content || '',
-          date: d.diary_date,
-        };
-        const media = localMediaByKey.get(diaryMediaKey(baseDiary)) || [];
+        const media = photosByDiary.get(d.id) || [];
         return {
         title: d.title || '',
         content: d.content || '',
@@ -1840,14 +1912,6 @@ async function saveToSupabase() {
     const deleteError = deleteResults.find(res => res.error)?.error;
     if (deleteError) throw deleteError;
 
-    const diaryRows = state.diaries.map(d => ({
-      couple_id: coupleId,
-      author_role: getDiaryAuthorRole(d),
-      diary_date: d.date,
-      title: d.title || '',
-      content: d.content || '',
-      tags: tagsToArray(d.tags),
-    }));
     const eventRows = state.events.map(e => ({
       couple_id: coupleId,
       name: e.name,
@@ -1864,8 +1928,36 @@ async function saveToSupabase() {
       visited: !!p.visited,
     }));
 
+    const insertedDiaries = [];
+    for (const d of state.diaries) {
+      const { data: inserted, error: diaryError } = await supabaseClient
+        .from('diaries')
+        .insert({
+          couple_id: coupleId,
+          author_role: getDiaryAuthorRole(d),
+          diary_date: d.date,
+          title: d.title || '',
+          content: d.content || '',
+          tags: tagsToArray(d.tags),
+        })
+        .select('id')
+        .single();
+      if (diaryError) throw diaryError;
+      insertedDiaries.push({ id: inserted.id, diary: d });
+    }
+
+    const photoRows = insertedDiaries.flatMap(({ id, diary }) =>
+      getDiaryMedia(diary)
+        .filter(media => media.storagePath)
+        .map((media, sortOrder) => ({
+          diary_id: id,
+          storage_path: media.storagePath,
+          sort_order: sortOrder,
+        }))
+    );
+
     const insertResults = await Promise.all([
-      diaryRows.length ? supabaseClient.from('diaries').insert(diaryRows) : Promise.resolve({ error: null }),
+      photoRows.length ? supabaseClient.from('diary_photos').insert(photoRows) : Promise.resolve({ error: null }),
       eventRows.length ? supabaseClient.from('calendar_events').insert(eventRows) : Promise.resolve({ error: null }),
       placeRows.length ? supabaseClient.from('places').insert(placeRows) : Promise.resolve({ error: null }),
     ]);
@@ -2299,7 +2391,7 @@ function removePhoto(idx) {
   renderPhotoPreview();
 }
 
-function saveDiary() {
+async function saveDiary() {
   const title = document.getElementById('diary-title-input').value.trim();
   const content = document.getElementById('diary-content-input').value.trim();
   const date = document.getElementById('diary-date-input').value;
@@ -2307,6 +2399,22 @@ function saveDiary() {
   const authorRole = document.querySelector('input[name="author"]:checked').value;
   const author = getAuthorName(authorRole);
   if (!content) return showToast('내용을 입력해주세요');
+  let media = [...state.uploadedMedia];
+  if (media.some(isLocalMedia) && supabaseClient) {
+    try {
+      document.getElementById('diary-save-btn').disabled = true;
+      document.getElementById('diary-save-btn').textContent = '업로드 중...';
+      media = await persistDiaryMedia(media);
+      state.uploadedMedia = media;
+      renderPhotoPreview();
+    } catch (err) {
+      console.warn('Media upload failed:', err);
+      showToast('사진 업로드에 실패했어요. Storage 설정을 확인해주세요');
+      document.getElementById('diary-save-btn').disabled = false;
+      document.getElementById('diary-save-btn').textContent = state.editingDiaryIndex === null ? '저장하기' : '수정하기';
+      return;
+    }
+  }
   const diary = {
     title,
     content,
@@ -2314,8 +2422,8 @@ function saveDiary() {
     tags,
     author,
     authorRole,
-    media: [...state.uploadedMedia],
-    photos: state.uploadedMedia.filter(m => m.type === 'image').map(m => m.src),
+    media,
+    photos: media.filter(m => m.type === 'image').map(m => m.src),
   };
   const previousDiaries = [...state.diaries];
   const wasEditing = state.editingDiaryIndex !== null;
@@ -2328,12 +2436,16 @@ function saveDiary() {
     state.diaries = previousDiaries;
     renderDiary();
     renderHome();
+    document.getElementById('diary-save-btn').disabled = false;
+    document.getElementById('diary-save-btn').textContent = wasEditing ? '수정하기' : '저장하기';
     return;
   }
   closeWriteModal();
   renderDiary();
   renderHome();
   showToast(wasEditing ? '일기가 수정됐어요 📓' : '일기가 저장됐어요 📓');
+  document.getElementById('diary-save-btn').disabled = false;
+  document.getElementById('diary-save-btn').textContent = '저장하기';
   state.editingDiaryIndex = null;
 }
 
