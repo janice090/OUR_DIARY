@@ -541,6 +541,32 @@
     color: var(--accent);
   }
 
+  .diary-card-media {
+    position: relative;
+    height: 160px;
+    background: var(--accent-light);
+    overflow: hidden;
+  }
+
+  .diary-card-media img,
+  .diary-card-media video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .media-count-badge {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    border-radius: 999px;
+    padding: 3px 8px;
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    font-size: 11px;
+  }
+
   .diary-card-body {
     padding: 1rem 1.1rem;
   }
@@ -695,9 +721,21 @@
     position: relative;
   }
 
-  .photo-preview-item img {
+  .photo-preview-item img,
+  .photo-preview-item video {
     width: 100%; height: 100%;
     object-fit: cover;
+  }
+
+  .media-type-badge {
+    position: absolute;
+    left: 4px;
+    bottom: 4px;
+    border-radius: 999px;
+    padding: 2px 6px;
+    background: rgba(0,0,0,0.48);
+    color: #fff;
+    font-size: 10px;
   }
 
   .photo-remove {
@@ -1373,13 +1411,13 @@
       <input type="text" class="form-input" id="diary-tags-input" placeholder="데이트, 카페, 여행 (쉼표로 구분)">
     </div>
     <div class="form-group">
-      <label class="form-label">사진 첨부</label>
+      <label class="form-label">사진 / 동영상 첨부</label>
       <div class="photo-upload" onclick="document.getElementById('photo-file').click()">
         <div class="photo-upload-icon">📷</div>
-        <div>사진을 클릭해서 추가하세요</div>
-        <div style="font-size:11px;margin-top:3px">JPG, PNG, GIF 지원</div>
+        <div>사진이나 동영상을 클릭해서 추가하세요</div>
+        <div style="font-size:11px;margin-top:3px">JPG, PNG, GIF, MP4, MOV 지원</div>
       </div>
-      <input type="file" id="photo-file" multiple accept="image/*" style="display:none" onchange="handlePhotos(event)">
+      <input type="file" id="photo-file" multiple accept="image/*,video/*" style="display:none" onchange="handlePhotos(event)">
       <div class="photo-preview-grid" id="photo-preview"></div>
     </div>
     <div class="form-group">
@@ -1476,7 +1514,7 @@ const state = {
   startDate: (!savedStartDate || savedStartDate === '2023-03-14') ? '2026-06-07' : savedStartDate,
   settings: { ...defaultSettings, ...JSON.parse(localStorage.getItem('settings') || '{}') },
   currentMonth: new Date(),
-  uploadedPhotos: [],
+  uploadedMedia: [],
   selectedCat: '카페',
   editingDiaryIndex: null,
   editingPlaceIndex: null,
@@ -1487,13 +1525,20 @@ const state = {
 };
 
 function save() {
-  localStorage.setItem('diaries', JSON.stringify(state.diaries));
-  localStorage.setItem('events', JSON.stringify(state.events));
-  localStorage.setItem('places', JSON.stringify(state.places));
-  localStorage.setItem('startDate', state.startDate);
-  localStorage.setItem('settings', JSON.stringify(state.settings));
-  if (state.coupleId) localStorage.setItem('coupleId', state.coupleId);
-  scheduleCloudSave();
+  try {
+    localStorage.setItem('diaries', JSON.stringify(state.diaries));
+    localStorage.setItem('events', JSON.stringify(state.events));
+    localStorage.setItem('places', JSON.stringify(state.places));
+    localStorage.setItem('startDate', state.startDate);
+    localStorage.setItem('settings', JSON.stringify(state.settings));
+    if (state.coupleId) localStorage.setItem('coupleId', state.coupleId);
+    scheduleCloudSave();
+    return true;
+  } catch (err) {
+    console.warn('Local save failed:', err);
+    showToast('첨부 용량이 커서 저장에 실패했어요');
+    return false;
+  }
 }
 
 // ===================== UTILS =====================
@@ -1529,6 +1574,75 @@ function escapeHtml(value) {
     '"': '&quot;',
     "'": '&#39;'
   }[ch]));
+}
+
+function normalizeMedia(item) {
+  if (!item) return null;
+  if (typeof item === 'string') {
+    return {
+      type: item.startsWith('data:video') ? 'video' : 'image',
+      src: item,
+      name: '',
+    };
+  }
+  return {
+    type: item.type === 'video' ? 'video' : 'image',
+    src: item.src || item.url || '',
+    name: item.name || '',
+  };
+}
+
+function getDiaryMedia(diary) {
+  return (diary.media || diary.photos || []).map(normalizeMedia).filter(m => m && m.src);
+}
+
+function renderMediaThumb(media, className = '') {
+  if (!media) return `<div class="diary-card-img ${className}">📓</div>`;
+  if (media.type === 'video') {
+    return `<video class="${className}" src="${media.src}" muted playsinline preload="metadata"></video>`;
+  }
+  return `<img class="${className}" src="${media.src}" alt="첨부 이미지">`;
+}
+
+function diaryMediaKey(diary) {
+  return `${diary.date || diary.diary_date || ''}|${diary.title || ''}|${diary.content || ''}`;
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = ev => resolve(ev.target.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function compressImageFile(file) {
+  if (file.type === 'image/gif') return readFileAsDataUrl(file);
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const maxSide = 1280;
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', 0.74));
+    };
+    img.onerror = async () => {
+      URL.revokeObjectURL(url);
+      resolve(await readFileAsDataUrl(file));
+    };
+    img.src = url;
+  });
+}
+
+function prettyBytes(bytes) {
+  return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)}MB` : `${Math.ceil(bytes / 1024)}KB`;
 }
 
 function authorInitial(name) {
@@ -1643,15 +1757,25 @@ async function loadFromSupabase() {
     }
 
     if (diariesRes.data?.length) {
-      state.diaries = diariesRes.data.map(d => ({
+      const localMediaByKey = new Map(state.diaries.map(d => [diaryMediaKey(d), getDiaryMedia(d)]));
+      state.diaries = diariesRes.data.map(d => {
+        const baseDiary = {
+          title: d.title || '',
+          content: d.content || '',
+          date: d.diary_date,
+        };
+        const media = localMediaByKey.get(diaryMediaKey(baseDiary)) || [];
+        return {
         title: d.title || '',
         content: d.content || '',
         date: d.diary_date,
         tags: tagsToText(d.tags),
         authorRole: d.author_role || 'a',
         author: getAuthorName(d.author_role || 'a'),
-        photos: [],
-      }));
+          media,
+          photos: media.filter(m => m.type === 'image').map(m => m.src),
+        };
+      });
     }
 
     if (eventsRes.data?.length) {
@@ -2071,8 +2195,12 @@ function renderDiary() {
 
   grid.innerHTML = sorted.map(d => {
     const tags = d.tags ? d.tags.split(',').map(t => t.trim()).filter(Boolean) : [];
-    const imgHtml = d.photos && d.photos.length
-      ? `<img src="${d.photos[0]}" class="diary-card-img" alt="사진">`
+    const media = getDiaryMedia(d);
+    const imgHtml = media.length
+      ? `<div class="diary-card-media">
+          ${renderMediaThumb(media[0])}
+          ${media.length > 1 ? `<span class="media-count-badge">+${media.length - 1}</span>` : ''}
+        </div>`
       : `<div class="diary-card-img">📓</div>`;
     return `<div class="diary-card" onclick="openEditDiary(${d.index})">
       ${imgHtml}
@@ -2100,7 +2228,7 @@ function openWriteModal() {
   document.getElementById('diary-delete-btn').style.display = 'none';
   document.getElementById('photo-preview').innerHTML = '';
   renderAuthorOptions('a');
-  state.uploadedPhotos = [];
+  state.uploadedMedia = [];
   document.getElementById('write-modal').classList.add('open');
 }
 
@@ -2112,7 +2240,7 @@ function openEditDiary(index) {
   document.getElementById('diary-title-input').value = diary.title || '';
   document.getElementById('diary-content-input').value = diary.content || '';
   document.getElementById('diary-tags-input').value = diary.tags || '';
-  state.uploadedPhotos = [...(diary.photos || [])];
+  state.uploadedMedia = getDiaryMedia(diary);
   renderPhotoPreview();
   renderAuthorOptions(getDiaryAuthorRole(diary));
   document.getElementById('write-modal-title').textContent = '일기 수정 ✍️';
@@ -2125,31 +2253,49 @@ function closeWriteModal() {
   document.getElementById('write-modal').classList.remove('open');
 }
 
-function handlePhotos(e) {
+async function handlePhotos(e) {
   const files = Array.from(e.target.files);
-  files.forEach(file => {
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      state.uploadedPhotos.push(ev.target.result);
+  for (const file of files) {
+    if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) continue;
+
+    if (file.type.startsWith('video/') && file.size > 4 * 1024 * 1024) {
+      showToast(`영상 ${file.name}은 ${prettyBytes(file.size)}라 너무 커요`);
+      continue;
+    }
+
+    try {
+      const src = file.type.startsWith('image/')
+        ? await compressImageFile(file)
+        : await readFileAsDataUrl(file);
+      state.uploadedMedia.push({
+        type: file.type.startsWith('video/') ? 'video' : 'image',
+        src,
+        name: file.name,
+      });
       renderPhotoPreview();
-    };
-    reader.readAsDataURL(file);
-  });
+    } catch (err) {
+      console.warn('Media read failed:', err);
+      showToast(`${file.name} 첨부에 실패했어요`);
+    }
+  }
   e.target.value = '';
 }
 
 function renderPhotoPreview() {
   const preview = document.getElementById('photo-preview');
-  preview.innerHTML = state.uploadedPhotos.map((src, idx) => `
+  preview.innerHTML = state.uploadedMedia.map((media, idx) => `
     <div class="photo-preview-item">
-      <img src="${src}">
+      ${media.type === 'video'
+        ? `<video src="${media.src}" muted playsinline controls preload="metadata"></video>`
+        : `<img src="${media.src}" alt="첨부 이미지">`}
+      <span class="media-type-badge">${media.type === 'video' ? '영상' : '사진'}</span>
       <button class="photo-remove" onclick="removePhoto(${idx})">×</button>
     </div>
   `).join('');
 }
 
 function removePhoto(idx) {
-  state.uploadedPhotos.splice(idx, 1);
+  state.uploadedMedia.splice(idx, 1);
   renderPhotoPreview();
 }
 
@@ -2161,17 +2307,33 @@ function saveDiary() {
   const authorRole = document.querySelector('input[name="author"]:checked').value;
   const author = getAuthorName(authorRole);
   if (!content) return showToast('내용을 입력해주세요');
-  const diary = { title, content, date, tags, author, authorRole, photos: [...state.uploadedPhotos] };
+  const diary = {
+    title,
+    content,
+    date,
+    tags,
+    author,
+    authorRole,
+    media: [...state.uploadedMedia],
+    photos: state.uploadedMedia.filter(m => m.type === 'image').map(m => m.src),
+  };
+  const previousDiaries = [...state.diaries];
+  const wasEditing = state.editingDiaryIndex !== null;
   if (state.editingDiaryIndex === null) {
     state.diaries.push(diary);
   } else {
     state.diaries[state.editingDiaryIndex] = diary;
   }
-  save();
+  if (!save()) {
+    state.diaries = previousDiaries;
+    renderDiary();
+    renderHome();
+    return;
+  }
   closeWriteModal();
   renderDiary();
   renderHome();
-  showToast(state.editingDiaryIndex === null ? '일기가 저장됐어요 📓' : '일기가 수정됐어요 📓');
+  showToast(wasEditing ? '일기가 수정됐어요 📓' : '일기가 저장됐어요 📓');
   state.editingDiaryIndex = null;
 }
 
